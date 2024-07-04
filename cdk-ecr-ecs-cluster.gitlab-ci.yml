@@ -1,0 +1,172 @@
+# GitLab CI/CD Configuration
+# Predefined CI Variables             : https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+# CI/CD YAML syntax reference         : https://docs.gitlab.com/ee/ci/yaml/
+# Optimize GitLab CI/CD configuration : https://docs.gitlab.com/ee/ci/yaml/yaml_optimization.html
+---
+stages:
+  - build
+  - dev
+  - qa
+  - prod
+
+variables:
+  IMAGE_REGISTRY: $IMAGE_REGISTRY_HOST
+  TAG_COMMIT: $IMAGE_REGISTRY_HOST/${IMAGE_NAME}:$CI_COMMIT_SHORT_SHA
+  TAG_DEV: $IMAGE_REGISTRY_HOST/${IMAGE_NAME}:dev
+  TAG_QA: $IMAGE_REGISTRY_HOST/${IMAGE_NAME}:qa
+  TAG_PROD: $IMAGE_REGISTRY_HOST/${IMAGE_NAME}:prod
+
+default:
+  tags:
+    - docker # runs only Docker Runners
+
+.release-job: # NOTE! Managed by Infra Team
+  image: docker:stable
+  services:
+    - docker:dind
+  variables:
+    DOCKER_DRIVER: overlay2
+    DOCKER_HOST: tcp://docker:2375/
+    DOCKER_TLS_CERTDIR: ""
+  before_script:
+    - apk add --no-cache curl jq python3 py3-pip
+    - pip install awscli
+    - aws --version
+    - docker --version
+    - docker info
+    - aws ecr get-login-password --region $AWS_DEFAULT_REGION | docker login --username AWS --password-stdin $IMAGE_REGISTRY
+
+.assume-iam-role: # NOTE! Managed by Infra Team
+  image: node:20-alpine
+  id_tokens: # OpenID Connect: https://gitlab.com/guided-explorations/aws/configure-openid-connect-in-aws
+    MY_OIDC_TOKEN:
+      aud: ${OIDC_TOKEN_AUD}
+  variables:
+    AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/web_identity_token # Required
+  before_script:
+    - apk add --no-cache curl jq python3 py3-pip
+    - pip install awscli --break-system-packages
+    - echo "${MY_OIDC_TOKEN}" > $AWS_WEB_IDENTITY_TOKEN_FILE
+
+.release-image-job: &release-image-job
+  only:
+    - main
+  extends:
+    - .release-job
+  variables:
+    GIT_STRATEGY: none # Skips Git operations
+  script:
+    - docker pull ${TAG_COMMIT}
+    - docker tag ${TAG_COMMIT} ${RELEASE_TAG}
+    - docker push ${RELEASE_TAG}
+
+.aws-resources-job: &aws-resources-job
+  only:
+    - main
+  extends:
+    - .assume-iam-role
+  script:
+    - export CDK_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    - npm install --prefix infra
+    - cd infra
+    - cp $CDK_ENV_FILE .env
+    - cat .env
+    # - npx aws-cdk bootstrap # NOTE! Must be run only once to initialize CDK
+    - npm run deploy
+
+.deploy-job: &deploy-job
+  only:
+    - main
+  extends:
+    - .assume-iam-role
+  variables:
+    GIT_STRATEGY: none # Skips Git operations
+  script:
+    - aws ecs update-service --cluster $ECS_CLUSTER_NAME --service $SERVICE_NAME --force-new-deployment > /dev/null
+
+####################################################
+# CI Jobs:
+####################################################
+build-image:
+  stage: build
+  only:
+    - main
+  extends: .release-job
+  image: jdrouet/docker-with-buildx:stable
+  script: # Build Multi-Platform Images: https://docs.docker.com/build/building/multi-platform/
+    - docker buildx version
+    - docker buildx create --use
+    - docker buildx build --push --platform linux/amd64,linux/arm64 -t ${TAG_COMMIT} ${CI_PROJECT_DIR}
+
+######################## DEV #######################
+dev:release-image:
+  <<: *release-image-job
+  stage: dev
+  variables:
+    RELEASE_TAG: ${TAG_DEV}
+
+dev:aws-resources:
+  <<: *aws-resources-job
+  stage: dev
+  environment: dev
+  needs:
+    - job: dev:release-image
+  variables:
+    IMAGE_URI: ${TAG_DEV}
+
+dev:deploy:
+  <<: *deploy-job
+  stage: dev
+  environment: dev
+  needs:
+    - job: dev:aws-resources
+
+######################## QA #######################
+qa:release-image:
+  <<: *release-image-job
+  stage: qa
+  when: manual
+  variables:
+    RELEASE_TAG: ${TAG_QA}
+
+qa:aws-resources:
+  <<: *aws-resources-job
+  stage: qa
+  environment: qa
+  needs:
+    - job: qa:release-image
+  variables:
+    IMAGE_URI: ${TAG_QA}
+
+qa:deploy:
+  <<: *deploy-job
+  stage: qa
+  environment: qa
+  needs:
+    - job: qa:aws-resources
+
+######################## PROD #######################
+prod:release-image:
+  <<: *release-image-job
+  stage: prod
+  when: manual
+  needs:
+    - job: qa:deploy
+  variables:
+    RELEASE_TAG: ${TAG_PROD}
+
+prod:aws-resources:
+  <<: *aws-resources-job
+  stage: prod
+  environment: prod
+  needs:
+    - job: prod:release-image
+  variables:
+    IMAGE_URI: ${TAG_PROD}
+
+prod:deploy:
+  <<: *deploy-job
+  stage: prod
+  environment: prod
+  needs:
+    - job: prod:aws-resources

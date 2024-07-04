@@ -1,0 +1,142 @@
+# GitLab CI/CD Configuration
+# Predefined CI Variables             : https://docs.gitlab.com/ee/ci/variables/predefined_variables.html
+# CI/CD YAML syntax reference         : https://docs.gitlab.com/ee/ci/yaml/
+# Optimize GitLab CI/CD configuration : https://docs.gitlab.com/ee/ci/yaml/yaml_optimization.html
+---
+stages:
+  - test
+  - dev
+  - qa
+  - prod
+
+default:
+  tags:
+    - docker # runs only Docker Runners
+
+.assume-iam-role: # NOTE! Managed by Infra Team
+  image: node:20-alpine
+  id_tokens: # OpenID Connect: https://gitlab.com/guided-explorations/aws/configure-openid-connect-in-aws
+    MY_OIDC_TOKEN:
+      aud: ${OIDC_TOKEN_AUD}
+  variables:
+    AWS_WEB_IDENTITY_TOKEN_FILE: /tmp/web_identity_token # Required
+  before_script:
+    - apk add --no-cache curl jq python3 py3-pip
+    - pip install awscli --break-system-packages
+    - echo "${MY_OIDC_TOKEN}" > $AWS_WEB_IDENTITY_TOKEN_FILE
+
+.common-conditions:
+  image: node:20-alpine
+  cache:
+    key:
+      files:
+        - pnpm-lock.yaml
+    paths:
+      - node_modules/
+      - .pnpm-store/
+    policy: pull-push
+  variables:
+    VITE_IMAGE_CDN_URL: $IMAGE_CDN_URL
+    VITE_IMAGE_CDN_SRC_BUCKET: $IMAGE_CDN_SRC_BUCKET
+    VITE_AWS_RUM_APPLICATION_ID: $AWS_RUM_APPLICATION_ID
+    VITE_AWS_RUM_IDENTITY_POOL_ID: $AWS_RUM_IDENTITY_POOL_ID
+    VITE_ACCESS_PORTFOLIO_URL: $ACCESS_PORTFOLIO_URL
+    VITE_GA_MEASUREMENT_ID: $GA_MEASUREMENT_ID
+    VITE_ENV: $CI_ENVIRONMENT_NAME
+  before_script:
+    - corepack enable
+    - corepack prepare pnpm@latest --activate
+    - pnpm config set store-dir .pnpm-store
+
+.aws-resources-job: &aws-resources-job
+  only:
+    - main
+  extends:
+    - .assume-iam-role
+  script:
+    - export CDK_ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+    - npm install --prefix infra
+    - cd infra
+    - cp $CDK_ENV_FILE .env
+    - cat .env
+    #        - npx aws-cdk bootstrap # NOTE! Must be run only once to initialize CDK
+    - npm run deploy
+
+.deploy-job: &deploy-job
+  only:
+    - main
+  extends:
+    - .common-conditions
+    - .assume-iam-role
+  script:
+    - corepack enable
+    - corepack prepare pnpm@latest --activate
+    - pnpm config set store-dir .pnpm-store
+    - pnpm install
+    - pnpm run build
+    - aws s3 sync --delete ./dist s3://${APP_DOMAIN} --cache-control ${S3_CACHE_CONTROL}
+    - aws cloudfront create-invalidation --distribution-id ${CLOUDFRONT_ID} --paths "/*"
+
+####################################################
+# CI Jobs:
+####################################################
+test_job:
+  stage: test
+  environment: test
+  only:
+    - merge_requests
+  extends: .common-conditions
+  script:
+    - pnpm install
+    - pnpm run build
+    - pnpm run lint
+    - pnpm run test
+  artifacts:
+    when: always
+    paths:
+      - tests/unit/reports/junit.xml
+    reports:
+      junit: tests/unit/reports/junit.xml
+
+######################## DEV #######################
+dev:aws-resources:
+  <<: *aws-resources-job
+  stage: dev
+  environment: dev
+
+dev:deploy:
+  <<: *deploy-job
+  stage: dev
+  environment: dev
+  needs:
+    - job: dev:aws-resources
+
+######################## QA #######################
+qa:aws-resources:
+  <<: *aws-resources-job
+  stage: qa
+  environment: qa
+  when: manual
+
+qa:deploy:
+  <<: *deploy-job
+  stage: qa
+  environment: qa
+  needs:
+    - job: qa:aws-resources
+
+######################## PROD #######################
+prod:aws-resources:
+  <<: *aws-resources-job
+  stage: prod
+  environment: prod
+  when: manual
+  needs:
+    - job: qa:deploy
+
+prod:deploy:
+  <<: *deploy-job
+  stage: prod
+  environment: prod
+  needs:
+    - job: prod:aws-resources
